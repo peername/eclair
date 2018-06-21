@@ -239,8 +239,6 @@ class Router(nodeParams: NodeParams, watcher: ActorRef) extends FSM[State, Data]
       // finally we remove nodes that aren't tied to any channels anymore (and deduplicate them)
       val potentialStaleNodes = staleChannels.map(d.channels).flatMap(c => Set(c.nodeId1, c.nodeId2)).toSet
       val channels1 = d.channels -- staleChannels
-      // no need to iterate on all nodes, just on those that are affected by current pruning
-      val staleNodes = potentialStaleNodes.filterNot(nodeId => hasChannels(nodeId, channels1.values))
 
       // let's clean the db and send the events
       staleChannels.foreach { shortChannelId =>
@@ -253,13 +251,7 @@ class Router(nodeParams: NodeParams, watcher: ActorRef) extends FSM[State, Data]
         removeEdge(d.graph, ChannelDesc(c.shortChannelId, c.nodeId1, c.nodeId2))
         removeEdge(d.graph, ChannelDesc(c.shortChannelId, c.nodeId2, c.nodeId1))
       }
-      staleNodes.foreach {
-        case nodeId =>
-          log.info("pruning nodeId={} (stale)", nodeId)
-          db.removeNode(nodeId)
-          context.system.eventStream.publish(NodeLost(nodeId))
-      }
-      stay using d.copy(nodes = d.nodes -- staleNodes, channels = channels1, updates = d.updates -- staleUpdates)
+      stay using d.copy(channels = channels1, updates = d.updates -- staleUpdates)
 
     case Event(ExcludeChannel(desc@ChannelDesc(shortChannelId, nodeId, _)), d) =>
       val banDuration = nodeParams.channelExcludeDuration
@@ -319,19 +311,54 @@ class Router(nodeParams: NodeParams, watcher: ActorRef) extends FSM[State, Data]
       // On Android we ignore queries
       stay
 
+    case Event(reply@ReplyChannelRange(chainHash, firstBlockNum, numberOfBlocks, _, data), d) if (chainHash != nodeParams.chainHash) =>
+      sender ! TransportHandler.ReadAck(reply)
+      log.warning("received reply_channel_range message for chain {}, we're on {}", chainHash, nodeParams.chainHash)
+      stay
+
     case Event(reply@ReplyChannelRange(chainHash, firstBlockNum, numberOfBlocks, _, data), d) =>
       sender ! TransportHandler.ReadAck(reply)
-      if (chainHash != nodeParams.chainHash) {
-        log.warning("received reply_channel_range message for chain {}, we're on {}", chainHash, nodeParams.chainHash)
-      } else {
-        val (format, theirShortChannelIds, useGzip) = ChannelRangeQueries.decodeShortChannelIds(data)
-        val ourShortChannelIds: SortedSet[ShortChannelId] = d.channels.keySet.filter(keep(firstBlockNum, numberOfBlocks, _, d.channels, d.updates))
-        val missing: SortedSet[ShortChannelId] = theirShortChannelIds -- ourShortChannelIds
-        log.info("we received their reply, we're missing {} channel announcements/updates, format={} useGzip={}", missing.size, format, useGzip)
-        val blocks = ChannelRangeQueries.encodeShortChannelIds(firstBlockNum, numberOfBlocks, missing, format, useGzip)
-        blocks.foreach(block => sender ! QueryShortChannelIds(chainHash, block.shortChannelIds))
+      val (format, theirShortChannelIds, useGzip) = ChannelRangeQueries.decodeShortChannelIds(data)
+      val ourShortChannelIds: SortedSet[ShortChannelId] = d.channels.keySet.filter(keep(firstBlockNum, numberOfBlocks, _, d.channels, d.updates))
+      val missing: SortedSet[ShortChannelId] = theirShortChannelIds -- ourShortChannelIds
+      log.info("we received their reply, we're missing {} channel announcements/updates, format={} useGzip={}", missing.size, format, useGzip)
+      val blocks = ChannelRangeQueries.encodeShortChannelIds(firstBlockNum, numberOfBlocks, missing, format, useGzip)
+      blocks.foreach(block => sender ! QueryShortChannelIds(chainHash, block.shortChannelIds))
+
+      // we have channel announcement that they don't have: check if can can prune them
+      val pruningCandidates = {
+        val shortChannelIds = ourShortChannelIds -- theirShortChannelIds
+        log.info("we have {} channel that they do not have", shortChannelIds.size)
+        d.channels.filterKeys(id => shortChannelIds.contains(id))
       }
-      stay
+
+      val staleChannels = getStaleChannels(pruningCandidates.values, d.updates)
+      // then we clean up the related channel updates
+      val staleUpdates = staleChannels.map(d.channels).flatMap(c => Seq(ChannelDesc(c.shortChannelId, c.nodeId1, c.nodeId2), ChannelDesc(c.shortChannelId, c.nodeId2, c.nodeId1)))
+      // finally we remove nodes that aren't tied to any channels anymore (and deduplicate them)
+      val potentialStaleNodes = staleChannels.map(d.channels).flatMap(c => Set(c.nodeId1, c.nodeId2)).toSet
+      val channels1 = d.channels -- staleChannels
+      // no need to iterate on all nodes, just on those that are affected by current pruning
+      val staleNodes = potentialStaleNodes.filterNot(nodeId => hasChannels(nodeId, channels1.values))
+
+      // let's clean the db and send the events
+      staleChannels.foreach { shortChannelId =>
+        log.info("pruning shortChannelId={} (stale)", shortChannelId)
+        db.removeChannel(shortChannelId) // NB: this also removes channel updates
+        context.system.eventStream.publish(ChannelLost(shortChannelId))
+      }
+      // we also need to remove updates from the graph
+      staleChannels.map(d.channels).foreach { c =>
+        removeEdge(d.graph, ChannelDesc(c.shortChannelId, c.nodeId1, c.nodeId2))
+        removeEdge(d.graph, ChannelDesc(c.shortChannelId, c.nodeId2, c.nodeId1))
+      }
+      staleNodes.foreach {
+        case nodeId =>
+          log.info("pruning nodeId={} (stale)", nodeId)
+          db.removeNode(nodeId)
+          context.system.eventStream.publish(NodeLost(nodeId))
+      }
+      stay using d.copy(nodes = d.nodes -- staleNodes, channels = channels1, updates = d.updates -- staleUpdates)
 
     case Event(query@QueryShortChannelIds(chainHash, data), d) =>
       sender ! TransportHandler.ReadAck(query)
@@ -552,7 +579,7 @@ object Router {
     val validChannels = (channels -- staleChannels).values
     val staleUpdates = staleChannels.map(channels).flatMap(c => Seq(ChannelDesc(c.shortChannelId, c.nodeId1, c.nodeId2), ChannelDesc(c.shortChannelId, c.nodeId2, c.nodeId1)))
     val validUpdates = (updates -- staleUpdates).values
-    val validNodes = validChannels.foldLeft(Set.empty[NodeAnnouncement]) { case (nodesAcc, c) => nodesAcc ++  nodes.get(c.nodeId1) ++ nodes.get(c.nodeId2) } // using a set deduplicates nodes
+    val validNodes = validChannels.foldLeft(Set.empty[NodeAnnouncement]) { case (nodesAcc, c) => nodesAcc ++ nodes.get(c.nodeId1) ++ nodes.get(c.nodeId2) } // using a set deduplicates nodes
     (validChannels, validNodes, validUpdates)
   }
 
